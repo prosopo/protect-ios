@@ -3,7 +3,7 @@
 
 import Foundation
 
-/// Handles HTTP communication with the Bumblebee server for App Attest operations.
+/// Handles HTTP communication with the Protect server for App Attest operations.
 ///
 /// This client is used internally by the SDK and should NOT be routed through
 /// `ProsopoURLProtocol` to avoid infinite recursion. It uses its own URLSession
@@ -35,11 +35,17 @@ final class NetworkClient: @unchecked Sendable {
 
     // MARK: - API Methods
 
-    /// Fetch a new challenge from Bumblebee.
+    /// Fetch a new challenge from Protect.
     func fetchChallenge(keyId: String? = nil) async throws -> String {
         let url = serverURL.appendingPathComponent("/api/ios/challenge")
         let request = ChallengeRequest(siteKey: siteKey, keyId: keyId)
         let response: ChallengeResponse = try await post(url: url, body: request)
+        // The challenge call is the only SDK-to-Protect request frequent
+        // enough to keep this fresh: attestation happens once per key, and
+        // /api/ios/verify is a Lambda-to-Protect call the device never sees.
+        if let routes = response.protectedRoutes {
+            ProsopoAttestIOS.shared.mergeProtectedRoutes(routes)
+        }
         return response.challenge
     }
 

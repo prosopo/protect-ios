@@ -3,7 +3,7 @@
 
 import Foundation
 
-// MARK: - API Request/Response types matching Bumblebee endpoints
+// MARK: - API Request/Response types matching Protect endpoints
 
 struct ChallengeRequest: Codable {
     let siteKey: String
@@ -17,6 +17,14 @@ struct ChallengeRequest: Codable {
 
 struct ChallengeResponse: Codable {
     let challenge: String
+    /// Path prefixes Protect gates for this site, as observed by the server.
+    /// Optional so an older Protect server that does not send it still parses.
+    let protectedRoutes: [String]?
+
+    enum CodingKeys: String, CodingKey {
+        case challenge
+        case protectedRoutes = "protected_routes"
+    }
 }
 
 struct AttestRequest: Codable {

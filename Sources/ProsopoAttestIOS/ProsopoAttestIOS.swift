@@ -24,7 +24,7 @@ public final class ProsopoAttestIOS: @unchecked Sendable {
 
     /// Version of this SDK build. Bumped per shipped zip; surfaced in the
     /// configure log line so a customer's logs identify which build is running.
-    public static let sdkVersion = "0.1.5"
+    public static let sdkVersion = "0.1.6"
 
     // MARK: - Internal state
 
@@ -39,6 +39,11 @@ public final class ProsopoAttestIOS: @unchecked Sendable {
     /// The domains to intercept. If empty, all domains are intercepted.
     /// Set via `configure(siteKey:serverURL:protectedDomains:)`.
     private(set) var protectedDomains: [String] = []
+
+    /// Which routes on those domains are worth signing, or nil when the host
+    /// app has not opted in and every path is signed as before. See
+    /// ``ProtectedRoutes``.
+    private(set) var protectedRoutes: ProtectedRoutes?
 
     /// Holds intercepted requests until the first attestation attempt settles,
     /// so an app that fetches on launch doesn't race its own attestation and
@@ -67,12 +72,20 @@ public final class ProsopoAttestIOS: @unchecked Sendable {
     ///
     /// - Parameters:
     ///   - siteKey: Your Prosopo site key
-    ///   - serverURL: The Bumblebee server URL (e.g., "https://protect.prosopo.io")
+    ///   - serverURL: The Protect server URL (e.g., "https://protect.prosopo.io")
     ///   - protectedDomains: Optional list of domains to protect. If empty, all requests are intercepted.
+    /// - Parameter protectedRoutes: opt in to signing only the routes Protect
+    ///   actually gates. `nil`, the default, signs every path on
+    ///   `protectedDomains`, which is the behaviour every existing integration
+    ///   already has. Pass a list — or an empty one — to turn filtering on; the
+    ///   SDK then learns the real set from the server and from deferred
+    ///   requests, so the list does not have to be right and does not tie the
+    ///   routing to app releases. See ``ProtectedRoutes``.
     public static func configure(
         siteKey: String,
         serverURL: String,
-        protectedDomains: [String] = []
+        protectedDomains: [String] = [],
+        protectedRoutes: [String]? = nil
     ) {
         guard let url = URL(string: serverURL) else {
             ProsopoLogger.error("Invalid server URL: \(serverURL)")
@@ -85,6 +98,7 @@ public final class ProsopoAttestIOS: @unchecked Sendable {
         instance.siteKey = siteKey
         instance.serverURL = url
         instance.protectedDomains = protectedDomains
+        instance.protectedRoutes = protectedRoutes.map { ProtectedRoutes(seed: $0) }
         instance.isConfigured = true
 
         let client = NetworkClient(serverURL: url, siteKey: siteKey)
@@ -172,6 +186,13 @@ public final class ProsopoAttestIOS: @unchecked Sendable {
         AppAttestManager.deviceCheckFault
     }
 
+    /// Seconds until the SDK will mint another App Attest key after Apple
+    /// reported the last one unusable. Non-zero means the device is unattested
+    /// and deliberately waiting rather than stuck.
+    public var keyRecoveryBackoff: TimeInterval {
+        attestManager?.keyRecoveryBackoff ?? 0
+    }
+
     /// First few characters of the current keyId, for on-screen debugging.
     public var keyIdPreview: String {
         guard let keyId = attestManager?.keyId else { return "<none>" }
@@ -215,6 +236,41 @@ public final class ProsopoAttestIOS: @unchecked Sendable {
     /// Header on a server response carrying the next piggybacked challenge.
     static let nextChallengeHeader = "X-Prosopo-Next-Challenge"
 
+    /// How the edge labels a response it generated itself, and the one value of
+    /// that label meaning "deferred, not denied".
+    static let statusHeader = "X-Prosopo-Status"
+    static let noSessionStatus = "no-session"
+
+    /// Whether `response` is the edge deferring a request for want of a session
+    /// rather than refusing the caller.
+    ///
+    /// Protect default-denies a cookie-less JSON request that carries no
+    /// assertion, with a 401 the web bundle answers by creating a session and
+    /// replaying. A native caller has no such bundle, so unless this is
+    /// recognised the app just sees the call fail — which is how a few
+    /// unattested seconds turn into a screen that never loads.
+    ///
+    /// The 401 is generated at the edge, so the origin never saw the request:
+    /// replaying it is safe even when it is not idempotent.
+    static func isSessionDeferral(_ response: URLResponse?) -> Bool {
+        guard let http = response as? HTTPURLResponse,
+              http.statusCode == 401,
+              let status = http.value(forHTTPHeaderField: statusHeader)
+        else {
+            return false
+        }
+        return status.caseInsensitiveCompare(noSessionStatus) == .orderedSame
+    }
+
+    /// Drive attestation because the edge just deferred a request.
+    ///
+    /// Awaited, unlike the fire-and-forget nudge in `assertionHeaders`: the
+    /// caller is deciding whether a replay is worth attempting, and that answer
+    /// depends on the attestation having finished.
+    func attestForDeferredRequest() async {
+        await attestManager?.retryAttestationIfDue()
+    }
+
     /// Mint a fresh set of App Attest assertion headers for a single request.
     ///
     /// This is the one place assertions are generated. Both the native
@@ -230,12 +286,28 @@ public final class ProsopoAttestIOS: @unchecked Sendable {
     ///   - method: HTTP method of the request being signed (e.g. `"GET"`).
     ///   - path: URL path of the request being signed (e.g. `"/api/foo"`).
     /// - Returns: Header name→value pairs to attach, or `nil` to forward unmodified.
-    func assertionHeaders(method: String, path: String) async -> [String: String]? {
+    /// - Parameter forceSign: set on a replay, where the edge has already told
+    ///   us the route is protected and the route filter's opinion is stale by
+    ///   definition.
+    func assertionHeaders(
+        method: String,
+        path: String,
+        forceSign: Bool = false
+    ) async -> [String: String]? {
         // Unconfigured is answered without waiting: the gate is only ever opened
         // by `configure`, so waiting on it here would hang every request in an
         // app that never called it.
         guard isConfigured else {
             ProsopoLogger.debug("Not configured, request will be forwarded unmodified")
+            return nil
+        }
+
+        // Answered before the readiness gate and before the attestation nudge:
+        // a route Protect does not gate needs neither, and making it wait on
+        // cold-start attestation would hand back the launch latency the filter
+        // exists to remove.
+        if !forceSign, let routes = protectedRoutes, !routes.shouldSign(path: path) {
+            ProsopoLogger.debug("\(path) is not a protected route — forwarding unsigned")
             return nil
         }
 
@@ -325,6 +397,19 @@ public final class ProsopoAttestIOS: @unchecked Sendable {
         return dcError.code == .invalidKey || dcError.code == .invalidInput
     }
 
+    /// Record that the edge deferred a request to `path`, so the route is
+    /// protected after all and later requests to it are signed first time.
+    func learnProtectedRoute(path: String) {
+        guard let routes = protectedRoutes, routes.learn(path: path) else { return }
+        ProsopoLogger.info("Learned protected route \(ProtectedRoutes.learnablePrefix(from: path))")
+    }
+
+    /// Merge the server's view of which routes it gates.
+    func mergeProtectedRoutes(_ serverPrefixes: [String]) {
+        guard let routes = protectedRoutes, routes.merge(serverPrefixes) else { return }
+        ProsopoLogger.info("Protected routes updated from server: \(routes.known.joined(separator: ", "))")
+    }
+
     /// Store a challenge piggybacked on a response (from either transport).
     func storeNextChallenge(_ challenge: String) {
         guard let challengeManager = challengeManager else { return }
@@ -352,7 +437,7 @@ public final class ProsopoAttestIOS: @unchecked Sendable {
         guard isConfigured else { return false }
         guard let host = request.url?.host else { return false }
 
-        // Never intercept requests to the Bumblebee server itself (by host AND port)
+        // Never intercept requests to the Protect server itself (by host AND port)
         if let serverHost = serverURL?.host,
            let serverPort = serverURL?.port,
            host == serverHost,

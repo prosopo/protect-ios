@@ -24,8 +24,13 @@ import Foundation
 ///
 /// It skips:
 /// - Requests already handled (prevents infinite recursion)
-/// - Requests to the Bumblebee server itself
-/// - Requests when the device is not yet attested (fail-open for MVP)
+/// - Requests to the Protect server itself
+/// - Requests when the device is not yet attested (fail-open)
+///
+/// Failing open is not the end of the story, because the edge default-denies an
+/// unsigned cookie-less JSON request. When that happens the response is a
+/// deferral rather than a refusal, and this protocol answers it the way
+/// protect.js answers it on the web: attest, then send the request again.
 public final class ProsopoURLProtocol: URLProtocol {
 
     /// Key used to mark requests as already handled.
@@ -59,58 +64,110 @@ public final class ProsopoURLProtocol: URLProtocol {
     }
 
     public override func startLoading() {
-        let prosopo = ProsopoAttestIOS.shared
-        let method = request.httpMethod ?? "GET"
-        let path = request.url?.path ?? "/"
-
-        // Mint assertion headers off the main thread, then forward. The shared
-        // helper handles the not-attested / failure cases (returning nil), the
-        // attestation retry nudge and the re-attest recovery, so this transport
-        // only has to attach + forward.
-        Task {
-            guard let headers = await prosopo.assertionHeaders(method: method, path: path) else {
-                self.forwardUnmodified()
-                return
-            }
-
-            guard let mutableRequest = self.handledCopyOfRequest() else {
-                self.failWithUnmarkableRequest()
-                return
-            }
-            for (name, value) in headers {
-                mutableRequest.setValue(value, forHTTPHeaderField: name)
-            }
-
-            ProsopoLogger.debug("Attached assertion headers to \(method) \(path)")
-
-            self.dataTask = self.internalSession.dataTask(with: mutableRequest as URLRequest) { data, response, error in
-                if let error = error {
-                    self.client?.urlProtocol(self, didFailWithError: error)
-                    return
-                }
-
-                if let response = response {
-                    // Extract piggybacked next challenge from response headers
-                    if let httpResponse = response as? HTTPURLResponse,
-                       let nextChallenge = httpResponse.value(forHTTPHeaderField: ProsopoAttestIOS.nextChallengeHeader) {
-                        prosopo.storeNextChallenge(nextChallenge)
-                    }
-
-                    self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-                }
-
-                if let data = data {
-                    self.client?.urlProtocol(self, didLoad: data)
-                }
-
-                self.client?.urlProtocolDidFinishLoading(self)
-            }
-            self.dataTask?.resume()
-        }
+        Task { await self.load(allowReplay: true) }
     }
 
     public override func stopLoading() {
         dataTask?.cancel()
+    }
+
+    // MARK: - Request lifecycle
+
+    /// Mint assertion headers off the main thread, attach them if we got any,
+    /// then send.
+    ///
+    /// `allowReplay` is false on the second pass, so a deferral can only ever
+    /// cost one extra round trip.
+    private func load(allowReplay: Bool, forceSign: Bool = false) async {
+        let prosopo = ProsopoAttestIOS.shared
+        let method = request.httpMethod ?? "GET"
+        let path = request.url?.path ?? "/"
+
+        guard let outgoing = handledCopyOfRequest() else {
+            failWithUnmarkableRequest()
+            return
+        }
+
+        // The shared helper handles the not-attested / failure cases (returning
+        // nil), the attestation retry nudge and the re-attest recovery, so this
+        // transport only has to attach + forward.
+        if let headers = await prosopo.assertionHeaders(
+            method: method, path: path, forceSign: forceSign
+        ) {
+            for (name, value) in headers {
+                outgoing.setValue(value, forHTTPHeaderField: name)
+            }
+            ProsopoLogger.debug("Attached assertion headers to \(method) \(path)")
+        } else if let operation = AppAttestManager.deviceCheckFaultOperation {
+            // Once the exception barrier stops DeviceCheck faults from crashing
+            // the app, they also stop showing up in the host app's crash
+            // reporter — which was our only sight of them. Tag the fail-open
+            // request so the fault is still countable server-side, and we can
+            // tell "fixed" from "merely silent". Only set while a fault is live,
+            // so ordinary not-yet-attested traffic isn't tagged.
+            outgoing.setValue(operation.rawValue, forHTTPHeaderField: "X-Prosopo-Attest-Fault")
+        }
+
+        send(outgoing, allowReplay: allowReplay)
+    }
+
+    private func send(_ outgoing: NSMutableURLRequest, allowReplay: Bool) {
+        let path = outgoing.url?.path ?? "/"
+
+        dataTask = internalSession.dataTask(with: outgoing as URLRequest) { data, response, error in
+            if let error = error {
+                self.client?.urlProtocol(self, didFailWithError: error)
+                return
+            }
+
+            if allowReplay, self.isReplayableDeferral(response) {
+                ProsopoLogger.warning(
+                    "Edge deferred \(path) for want of a session — attesting and replaying once"
+                )
+                Task { await self.replay() }
+                return
+            }
+
+            if let response = response {
+                // Extract piggybacked next challenge from response headers
+                if let httpResponse = response as? HTTPURLResponse,
+                   let nextChallenge = httpResponse.value(forHTTPHeaderField: ProsopoAttestIOS.nextChallengeHeader) {
+                    ProsopoAttestIOS.shared.storeNextChallenge(nextChallenge)
+                }
+
+                self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            }
+
+            if let data = data {
+                self.client?.urlProtocol(self, didLoad: data)
+            }
+
+            self.client?.urlProtocolDidFinishLoading(self)
+        }
+        dataTask?.resume()
+    }
+
+    /// Wait for attestation, then send the request again — signed, if the wait
+    /// produced a key.
+    ///
+    /// Worth doing even when it doesn't: the cost is one request, and the
+    /// alternative is handing the app a 401 it has no way to act on.
+    private func replay() async {
+        // The edge deferring this request is proof the route is protected,
+        // whatever the route filter believed a moment ago. Record it so the
+        // next request to it is signed first time, and sign this one.
+        ProsopoAttestIOS.shared.learnProtectedRoute(path: request.url?.path ?? "/")
+        await ProsopoAttestIOS.shared.attestForDeferredRequest()
+        await load(allowReplay: false, forceSign: true)
+    }
+
+    /// A deferral we can actually do something about.
+    ///
+    /// A streamed body is excluded: `URLProtocol` hands the stream over once, so
+    /// a replay would send an empty body rather than the caller's.
+    private func isReplayableDeferral(_ response: URLResponse?) -> Bool {
+        guard request.httpBodyStream == nil else { return false }
+        return ProsopoAttestIOS.isSessionDeferral(response)
     }
 
     // MARK: - Helpers
@@ -139,41 +196,5 @@ public final class ProsopoURLProtocol: URLProtocol {
     private func failWithUnmarkableRequest() {
         ProsopoLogger.error("Could not take a mutable copy of the request; failing it rather than looping")
         client?.urlProtocol(self, didFailWithError: ProsopoError.networkError("could not copy request"))
-    }
-
-    /// Forward the request without any modifications (fail-open behavior).
-    private func forwardUnmodified() {
-        guard let mutableRequest = handledCopyOfRequest() else {
-            failWithUnmarkableRequest()
-            return
-        }
-
-        // Once the exception barrier stops DeviceCheck faults from crashing the
-        // app, they also stop showing up in the host app's crash reporter —
-        // which was our only sight of them. Tag the fail-open request so the
-        // fault is still countable server-side, and we can tell "fixed" from
-        // "merely silent". Only set while a fault is live, so ordinary
-        // not-yet-attested traffic isn't tagged.
-        if let operation = AppAttestManager.deviceCheckFaultOperation {
-            mutableRequest.setValue(operation.rawValue, forHTTPHeaderField: "X-Prosopo-Attest-Fault")
-        }
-
-        dataTask = internalSession.dataTask(with: mutableRequest as URLRequest) { data, response, error in
-            if let error = error {
-                self.client?.urlProtocol(self, didFailWithError: error)
-                return
-            }
-
-            if let response = response {
-                self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            }
-
-            if let data = data {
-                self.client?.urlProtocol(self, didLoad: data)
-            }
-
-            self.client?.urlProtocolDidFinishLoading(self)
-        }
-        dataTask?.resume()
     }
 }

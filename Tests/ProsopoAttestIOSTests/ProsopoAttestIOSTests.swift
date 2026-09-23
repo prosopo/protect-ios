@@ -1,6 +1,7 @@
 // Copyright 2021-2026 Prosopo (UK) Ltd.
 // Licensed under the Apache License, Version 2.0
 
+import DeviceCheck
 import ProsopoAttestShim
 import XCTest
 @testable import ProsopoAttestIOS
@@ -251,6 +252,32 @@ final class RetryGateTests: XCTestCase {
         XCTAssertFalse(gate.isCoolingDown)
         XCTAssertTrue(gate.claim())
     }
+
+
+    /// The shape the key-recovery gate uses: never claimed, only failed, and
+    /// asked `isCoolingDown` before each attempt.
+    ///
+    /// It has to work without `claim()` because the thing being throttled is not
+    /// an attempt that can fail — the attestation it triggers succeeds every
+    /// time. What is being counted is a verdict that arrives later, from Apple,
+    /// about a key that was minted earlier. Recording that verdict must arm the
+    /// window on its own.
+    func testCooldownOnlyUsageEscalatesWithoutClaiming() {
+        let gate = RetryGate(label: "recovery", baseDelay: 10, maxDelay: 600)
+
+        XCTAssertFalse(gate.isCoolingDown)
+
+        gate.recordFailure("key unusable")
+        XCTAssertTrue(gate.isCoolingDown)
+        let first = gate.secondsUntilRetry
+
+        gate.recordFailure("key unusable again")
+        XCTAssertGreaterThan(
+            gate.secondsUntilRetry,
+            first,
+            "a second bad key must buy a longer pause than the first"
+        )
+    }
 }
 
 /// The fault marker sent on fail-open requests, which is how a DeviceCheck
@@ -312,7 +339,7 @@ final class ProsopoAttestIOSTests: XCTestCase {
 
     // MARK: - Assertion header contract
 
-    /// The header names are a contract with the Bumblebee server and must match
+    /// The header names are a contract with the Protect server and must match
     /// exactly what the native `ProsopoURLProtocol` sends, since the WebView shim
     /// reuses them. A typo here silently drops protection.
     func testAssertionHeaderNames() {
@@ -321,6 +348,71 @@ final class ProsopoAttestIOSTests: XCTestCase {
         XCTAssertEqual(ProsopoAttestIOS.clientDataHeader, "X-Prosopo-ClientData")
         XCTAssertEqual(ProsopoAttestIOS.challengeHeader, "X-Prosopo-Challenge")
         XCTAssertEqual(ProsopoAttestIOS.nextChallengeHeader, "X-Prosopo-Next-Challenge")
+        XCTAssertEqual(ProsopoAttestIOS.statusHeader, "X-Prosopo-Status")
+        XCTAssertEqual(ProsopoAttestIOS.noSessionStatus, "no-session")
+    }
+
+    // MARK: - Session deferral
+
+    private func response(status: Int, headers: [String: String] = [:]) -> HTTPURLResponse {
+        HTTPURLResponse(
+            url: URL(string: "https://example.test/api/thing")!,
+            statusCode: status,
+            httpVersion: "HTTP/1.1",
+            headerFields: headers
+        )!
+    }
+
+    /// The response the edge sends when it default-denies an unsigned
+    /// cookie-less JSON request. It is a deferral, not a refusal, and it is the
+    /// one thing worth replaying.
+    func testSessionDeferralIsRecognised() {
+        let deferred = response(
+            status: 401,
+            headers: [ProsopoAttestIOS.statusHeader: ProsopoAttestIOS.noSessionStatus]
+        )
+        XCTAssertTrue(ProsopoAttestIOS.isSessionDeferral(deferred))
+    }
+
+    /// HTTP header values are not case-normalised for us, and nothing stops the
+    /// edge or an intermediary changing the casing.
+    func testSessionDeferralIgnoresHeaderValueCasing() {
+        let deferred = response(status: 401, headers: [ProsopoAttestIOS.statusHeader: "No-Session"])
+        XCTAssertTrue(ProsopoAttestIOS.isSessionDeferral(deferred))
+    }
+
+    /// A bare 401 belongs to the customer's own API — their auth expiring, say.
+    /// Replaying it would be us silently retrying someone else's failure, so the
+    /// marker header is required, not merely checked when present.
+    func testAPlain401IsNotADeferral() {
+        XCTAssertFalse(ProsopoAttestIOS.isSessionDeferral(response(status: 401)))
+    }
+
+    /// A 403 is an access rule saying no. That is terminal by design, and
+    /// re-sending it with an assertion attached would not change the answer.
+    func testABlockIsNotADeferral() {
+        let blocked = response(
+            status: 403,
+            headers: [ProsopoAttestIOS.statusHeader: ProsopoAttestIOS.noSessionStatus]
+        )
+        XCTAssertFalse(ProsopoAttestIOS.isSessionDeferral(blocked))
+    }
+
+    func testASuccessIsNotADeferral() {
+        XCTAssertFalse(ProsopoAttestIOS.isSessionDeferral(response(status: 200)))
+        XCTAssertFalse(ProsopoAttestIOS.isSessionDeferral(nil))
+    }
+
+    /// A non-HTTP response cannot carry the marker, and must not be coerced into
+    /// looking like one.
+    func testANonHTTPResponseIsNotADeferral() {
+        let raw = URLResponse(
+            url: URL(string: "https://example.test/api/thing")!,
+            mimeType: nil,
+            expectedContentLength: 0,
+            textEncodingName: nil
+        )
+        XCTAssertFalse(ProsopoAttestIOS.isSessionDeferral(raw))
     }
 
     /// Fail-open: when the shared SDK has not been configured/attested,
@@ -504,4 +596,379 @@ final class ProsopoAttestIOSTests: XCTestCase {
         XCTAssertEqual(ProsopoWebviewBridge.challengeMessage, "prosopoChallenge")
     }
 #endif
+}
+
+/// The iOS 27 re-attestation loop, emulated.
+///
+/// Apple's half is what could not be reached before: App Attest does not exist
+/// on macOS, so the real enclave can never mint a key, let alone disown one.
+/// With the Apple layer behind `AppAttestProviding` it can be stood in for, and
+/// the observed behaviour reproduced exactly — attestation always succeeds, and
+/// each key stops working after about a dozen assertions.
+///
+/// Measured on the device that prompted this: 52 keys in 2h18m, against 1 in
+/// 6h on iOS 26.
+final class AttestationLoopTests: XCTestCase {
+
+    /// Stands in for the Secure Enclave on a device where Apple keeps
+    /// invalidating keys. Attestation works every time; the key it produced
+    /// dies `assertionsPerKey` assertions later, which is the shape the logs
+    /// show and the shape no gate was watching for.
+    private final class DyingKeyProvider: AppAttestProviding, @unchecked Sendable {
+        private let assertionsPerKey: Int
+        private let lock = NSLock()
+        private var minted = 0
+        private var assertionsOnCurrentKey = 0
+
+        init(assertionsPerKey: Int) {
+            self.assertionsPerKey = assertionsPerKey
+        }
+
+        /// How many App Attest keys Apple has been asked for. This is the
+        /// number the backoff exists to bound.
+        var keysMinted: Int { lock.withLock { minted } }
+
+        var supportState: Bool? { true }
+
+        func generateKey() async throws -> String {
+            lock.withLock {
+                minted += 1
+                assertionsOnCurrentKey = 0
+                return "key-\(minted)"
+            }
+        }
+
+        func attestKey(_ keyId: String, clientDataHash: Data) async throws -> Data {
+            Data("attestation-object".utf8)
+        }
+
+        func generateAssertion(_ keyId: String, clientDataHash: Data) async throws -> Data {
+            let dead = lock.withLock { () -> Bool in
+                assertionsOnCurrentKey += 1
+                return assertionsOnCurrentKey > assertionsPerKey
+            }
+            guard !dead else {
+                throw NSError(domain: DCErrorDomain, code: DCError.Code.invalidKey.rawValue)
+            }
+            return Data("assertion".utf8)
+        }
+    }
+
+    private struct StubTransport: AttestTransport {
+        func fetchChallenge(keyId: String?) async throws -> String { "00ff" }
+        func submitAttestation(
+            keyId: String,
+            attestationObject: Data,
+            challenge: String
+        ) async throws -> AttestResponse {
+            AttestResponse(success: true, keyId: keyId)
+        }
+    }
+
+    private final class MemoryKeyStore: KeyStore, @unchecked Sendable {
+        private let lock = NSLock()
+        private var keyId: String?
+        private var attested = false
+
+        func loadKeyId() -> String? { lock.withLock { keyId } }
+        func isAttested() -> Bool { lock.withLock { attested } }
+        func saveKeyId(_ newValue: String) -> Bool { lock.withLock { keyId = newValue; return true } }
+        func markAttested() -> Bool { lock.withLock { attested = true; return true } }
+        func deleteAll() { lock.withLock { keyId = nil; attested = false } }
+    }
+
+    /// One lap of the app's behaviour, as `ProsopoAttestIOS.assertionHeaders`
+    /// performs it: if the device is unattested the request goes out bare and
+    /// nudges a retry on the way; otherwise it is signed, and Apple calling the
+    /// key dead triggers a recovery.
+    ///
+    /// Both the `isUnusableKey` filter and the retry nudge live on the shared
+    /// singleton, and are inlined here so the test drives the manager without
+    /// configuring it.
+    private func makeRequests(_ count: Int, through manager: AppAttestManager) async {
+        for _ in 0..<count {
+            guard case .attested = manager.state else {
+                await manager.retryAttestationIfDue()
+                continue
+            }
+
+            do {
+                _ = try await manager.generateAssertion(
+                    challenge: "00ff", method: "GET", path: "/services/catalogue"
+                )
+            } catch let error as NSError where error.code == DCError.Code.invalidKey.rawValue {
+                await manager.recoverFromUnusableKey()
+            } catch {
+                XCTFail("unexpected assertion error: \(error)")
+            }
+        }
+    }
+
+    private func makeManager(
+        provider: AppAttestProviding
+    ) -> AppAttestManager {
+        AppAttestManager(
+            networkClient: StubTransport(),
+            provider: provider,
+            keyStore: MemoryKeyStore(),
+            attestGate: RetryGate(label: "test-attest", baseDelay: 5, maxDelay: 300),
+            keyRecoveryGate: RetryGate(label: "test-recovery", baseDelay: 5, maxDelay: 1800)
+        )
+    }
+
+    /// THE REPRODUCTION. 120 requests against a device that kills a key every
+    /// 12 assertions is ten dead keys' worth of provocation.
+    ///
+    /// Unthrottled, the SDK answers each death by minting another key
+    /// immediately — which is the behaviour measured in the field, and which
+    /// Apple rate-limits. Throttled, the first death is serviced at once and
+    /// the rest of the burst is refused until the window expires, so the device
+    /// asks Apple for a handful of keys rather than one per death.
+    func testKeysMintedAreBoundedWhenAppleKeepsKillingTheKey() async throws {
+        let provider = DyingKeyProvider(assertionsPerKey: 12)
+        let manager = makeManager(provider: provider)
+
+        try await manager.attestIfNeeded()
+        XCTAssertEqual(provider.keysMinted, 1, "precondition: one key to start with")
+
+        await makeRequests(120, through: manager)
+
+        XCTAssertLessThanOrEqual(
+            provider.keysMinted, 3,
+            "the backoff must bound key generation; unthrottled this reaches ~11"
+        )
+    }
+
+    /// Inside the window the device must stop claiming to be attested.
+    ///
+    /// Refusing to mint another key is not the same as carrying on. Apple has
+    /// said the key is dead, so a manager still reporting `.attested` sends
+    /// every subsequent request through a challenge fetch and an enclave call
+    /// to build an assertion that cannot work — and, worse,
+    /// `retryAttestationIfDue` sees `.attested` and declines to do anything, so
+    /// nothing recovers.
+    func testTheDeadKeyIsDroppedWhileTheWindowIsOpen() async throws {
+        let provider = DyingKeyProvider(assertionsPerKey: 1)
+        let manager = makeManager(provider: provider)
+
+        try await manager.attestIfNeeded()
+        XCTAssertNotNil(manager.keyId, "precondition: attested with a key")
+
+        // Two deaths: the first is serviced, the second lands inside the window.
+        await makeRequests(4, through: manager)
+
+        XCTAssertGreaterThan(manager.keyRecoveryBackoff, 0, "precondition: window is open")
+        XCTAssertNil(
+            manager.keyId,
+            "a manager inside the recovery window must not still be holding a dead key"
+        )
+    }
+
+    /// The traffic-driven retry must respect the recovery window too.
+    ///
+    /// It is the busiest way into attestation, so if it ignored the window it
+    /// would mint the key the recovery path had just declined to mint, and the
+    /// throttle would exist in name only.
+    func testTrafficDrivenRetryDoesNotBypassTheRecoveryWindow() async throws {
+        let provider = DyingKeyProvider(assertionsPerKey: 1)
+        let manager = makeManager(provider: provider)
+
+        try await manager.attestIfNeeded()
+        await makeRequests(4, through: manager)
+        let minted = provider.keysMinted
+
+        for _ in 0..<20 {
+            await manager.retryAttestationIfDue()
+        }
+
+        XCTAssertEqual(
+            provider.keysMinted, minted,
+            "retries inside the window must not mint keys the recovery path refused"
+        )
+    }
+
+    /// The backoff must not be a kill switch. Once the window expires the
+    /// device is allowed to try again, because the only acceptable resting
+    /// state is attested.
+    func testRecoveryIsAllowedAgainOnceTheWindowExpires() async throws {
+        let provider = DyingKeyProvider(assertionsPerKey: 1)
+        let manager = AppAttestManager(
+            networkClient: StubTransport(),
+            provider: provider,
+            keyStore: MemoryKeyStore(),
+            attestGate: RetryGate(label: "test-attest", baseDelay: 0.05, maxDelay: 1),
+            keyRecoveryGate: RetryGate(label: "test-recovery", baseDelay: 0.2, maxDelay: 1)
+        )
+
+        try await manager.attestIfNeeded()
+        await makeRequests(4, through: manager)
+        let beforeWait = provider.keysMinted
+
+        try await Task.sleep(nanoseconds: 500_000_000)
+        await makeRequests(4, through: manager)
+
+        XCTAssertGreaterThan(
+            provider.keysMinted, beforeWait,
+            "after the window expires the device must be allowed to re-attest"
+        )
+    }
+}
+
+/// The route filter and the learning that keeps it current.
+///
+/// The measured integration gates two routes out of everything the app calls,
+/// so 95% of assertions were minted for requests that never reached Protect.
+/// These pin both halves: which paths get signed, and how the set corrects
+/// itself without an app release.
+final class ProtectedRoutesTests: XCTestCase {
+
+    private var suiteName = ""
+    private var defaults = UserDefaults.standard
+
+    override func setUp() {
+        super.setUp()
+        // A suite per test: the real store persists, and a test that leaked into
+        // the next one would pass on the previous one's learning.
+        suiteName = "io.prosopo.protect.tests.\(name.hashValue)"
+        UserDefaults.standard.removePersistentDomain(forName: suiteName)
+        defaults = UserDefaults(suiteName: suiteName) ?? .standard
+    }
+
+    override func tearDown() {
+        UserDefaults.standard.removePersistentDomain(forName: suiteName)
+        super.tearDown()
+    }
+
+    private func store(seed: [String] = []) -> ProtectedRoutes {
+        ProtectedRoutes(seed: seed, defaults: defaults)
+    }
+
+    // MARK: - What gets remembered
+
+    /// The two real protected routes. One is two segments with no identifier,
+    /// the other is four with a numeric id on the end — which is why the prefix
+    /// is found by stripping identifiers rather than truncating to a depth.
+    func testTheRealProtectedRoutesReduceToTheRightPrefixes() {
+        XCTAssertEqual(
+            ProtectedRoutes.learnablePrefix(from: "/services/g2/inventory/listings/1865040444476362752"),
+            "/services/g2/inventory/listings"
+        )
+        XCTAssertEqual(
+            ProtectedRoutes.learnablePrefix(from: "/services/catalogue"),
+            "/services/catalogue"
+        )
+    }
+
+    /// Remembering the identifier would remember one event rather than the
+    /// route, and the set would grow without bound while matching almost
+    /// nothing.
+    func testIdentifierSegmentsAreStripped() {
+        XCTAssertEqual(ProtectedRoutes.learnablePrefix(from: "/a/b/123456"), "/a/b")
+        XCTAssertEqual(
+            ProtectedRoutes.learnablePrefix(from: "/a/b/9F1B4C2E-7A55-4D2E-9C1E-2B7A55D24C11"),
+            "/a/b"
+        )
+        XCTAssertEqual(ProtectedRoutes.learnablePrefix(from: "/a/b/1/2/3"), "/a/b")
+    }
+
+    /// A path that is nothing but an identifier leaves no route to remember,
+    /// and must not collapse to "/" — which would match everything.
+    func testAPathWithNothingButAnIdentifierIsNotLearnable() {
+        XCTAssertEqual(ProtectedRoutes.learnablePrefix(from: "/123456"), "")
+        XCTAssertEqual(ProtectedRoutes.learnablePrefix(from: "/"), "")
+
+        let routes = store()
+        XCTAssertFalse(routes.learn(path: "/123456"))
+        XCTAssertTrue(routes.known.isEmpty)
+    }
+
+    // MARK: - What gets signed
+
+    /// Knowing nothing, sign everything. The cost of a wasted assertion is a
+    /// round trip; the cost of the opposite is every route deferring at once.
+    func testAnEmptySetSignsEverything() {
+        let routes = store()
+        XCTAssertTrue(routes.shouldSign(path: "/services/catalogue"))
+        XCTAssertTrue(routes.shouldSign(path: "/anything/at/all"))
+    }
+
+    func testOnlyKnownPrefixesAreSignedOnceTheSetIsPopulated() {
+        let routes = store(seed: ["/services/catalogue", "/services/g2/inventory/listings"])
+
+        XCTAssertTrue(routes.shouldSign(path: "/services/catalogue"))
+        XCTAssertTrue(routes.shouldSign(path: "/services/g2/inventory/listings/186504044"))
+
+        // The five the event screen fires alongside the protected one. These are
+        // the 95%.
+        XCTAssertFalse(routes.shouldSign(path: "/services/events/186504044"))
+        XCTAssertFalse(routes.shouldSign(path: "/services/events/186504044/metrics"))
+        XCTAssertFalse(routes.shouldSign(path: "/services/events/186504044/tours"))
+        XCTAssertFalse(routes.shouldSign(path: "/services/g2/accounts/event-engagements/186504044"))
+    }
+
+    func testSeedsAreNormalisedToLeadingSlash() {
+        let routes = store(seed: ["services/catalogue"])
+        XCTAssertEqual(routes.known, ["/services/catalogue"])
+    }
+
+    // MARK: - Learning
+
+    /// A deferred request is proof the route is protected. This is what keeps
+    /// the filter current when the customer attaches Protect to a new route,
+    /// with no app release.
+    func testADeferredRequestTeachesTheRoute() {
+        let routes = store(seed: ["/services/catalogue"])
+        XCTAssertFalse(routes.shouldSign(path: "/services/g2/inventory/listings/186504044"))
+
+        XCTAssertTrue(routes.learn(path: "/services/g2/inventory/listings/186504044"))
+
+        XCTAssertTrue(routes.shouldSign(path: "/services/g2/inventory/listings/186504044"))
+        XCTAssertTrue(
+            routes.shouldSign(path: "/services/g2/inventory/listings/999"),
+            "learning one id must cover the route, not just that one event"
+        )
+    }
+
+    /// Only the first deferral on a route is news; the caller logs on the
+    /// change, not on every request.
+    func testLearningTheSameRouteTwiceIsNotNews() {
+        let routes = store()
+        XCTAssertTrue(routes.learn(path: "/services/catalogue"))
+        XCTAssertFalse(routes.learn(path: "/services/catalogue"))
+    }
+
+    /// What was learned has to outlive the process, or every cold start pays
+    /// the deferral again on every route.
+    func testLearnedRoutesSurviveARestart() {
+        store().learn(path: "/services/g2/inventory/listings/186504044")
+
+        let reopened = store()
+        XCTAssertEqual(reopened.known, ["/services/g2/inventory/listings"])
+        XCTAssertTrue(reopened.shouldSign(path: "/services/g2/inventory/listings/1"))
+    }
+
+    // MARK: - The server's view
+
+    func testTheServerListIsMergedIn() {
+        let routes = store()
+        XCTAssertTrue(routes.merge(["/services/catalogue", "/services/g2/inventory/listings"]))
+        XCTAssertEqual(routes.known, ["/services/catalogue", "/services/g2/inventory/listings"])
+    }
+
+    /// Additive, not authoritative. The server omitting a route we learned the
+    /// hard way is not evidence it is unprotected — it may simply not have been
+    /// requested since the server last looked.
+    func testTheServerListDoesNotEraseWhatWasLearned() {
+        let routes = store()
+        routes.learn(path: "/services/g2/inventory/listings/1")
+        routes.merge(["/services/catalogue"])
+
+        XCTAssertEqual(routes.known, ["/services/catalogue", "/services/g2/inventory/listings"])
+    }
+
+    func testAnEmptyOrUnchangedServerListIsNotAnUpdate() {
+        let routes = store(seed: ["/services/catalogue"])
+        XCTAssertFalse(routes.merge([]))
+        XCTAssertFalse(routes.merge(["/services/catalogue"]))
+    }
 }
