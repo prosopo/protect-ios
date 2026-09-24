@@ -972,3 +972,124 @@ final class ProtectedRoutesTests: XCTestCase {
         XCTAssertFalse(routes.merge(["/services/catalogue"]))
     }
 }
+
+
+/// Does the SDK call Apple's `generateAssertion` concurrently on one key?
+///
+/// This asks a question about our own code, not about Apple's. It needs no
+/// device and assumes nothing about what DeviceCheck does under contention —
+/// it simply counts how many calls are in flight at once when a screen fans
+/// out, which is a fact we can establish here and could otherwise only infer
+/// from a customer's logs.
+final class AssertionConcurrencyTests: XCTestCase {
+
+    /// Records the high-water mark of overlapping `generateAssertion` calls.
+    private final class OverlapCountingProvider: AppAttestProviding, @unchecked Sendable {
+        private let lock = NSLock()
+        private var inFlight = 0
+        private var peak = 0
+
+        /// The most assertions Apple was asked for at the same instant.
+        var peakConcurrentAssertions: Int { lock.withLock { peak } }
+
+        var supportState: Bool? { true }
+        func generateKey() async throws -> String { "key-1" }
+        func attestKey(_ keyId: String, clientDataHash: Data) async throws -> Data {
+            Data("attestation".utf8)
+        }
+
+        func generateAssertion(_ keyId: String, clientDataHash: Data) async throws -> Data {
+            lock.withLock {
+                inFlight += 1
+                peak = max(peak, inFlight)
+            }
+            // Long enough that genuinely parallel callers overlap here, short
+            // enough not to slow the suite.
+            try? await Task.sleep(nanoseconds: 20_000_000)
+            lock.withLock { inFlight -= 1 }
+            return Data("assertion".utf8)
+        }
+    }
+
+    private struct StubTransport: AttestTransport {
+        func fetchChallenge(keyId: String?) async throws -> String { "00ff" }
+        func submitAttestation(
+            keyId: String, attestationObject: Data, challenge: String
+        ) async throws -> AttestResponse {
+            AttestResponse(success: true, keyId: keyId)
+        }
+    }
+
+    private final class MemoryKeyStore: KeyStore, @unchecked Sendable {
+        private let lock = NSLock()
+        private var keyId: String?
+        private var attested = false
+        func loadKeyId() -> String? { lock.withLock { keyId } }
+        func isAttested() -> Bool { lock.withLock { attested } }
+        func saveKeyId(_ v: String) -> Bool { lock.withLock { keyId = v; return true } }
+        func markAttested() -> Bool { lock.withLock { attested = true; return true } }
+        func deleteAll() { lock.withLock { keyId = nil; attested = false } }
+    }
+
+    /// The event screen fires six requests at once. This measures what that
+    /// does to Apple.
+    func testAScreenFanOutOverlapsAssertionsOnOneKey() async throws {
+        let provider = OverlapCountingProvider()
+        let manager = AppAttestManager(
+            networkClient: StubTransport(),
+            provider: provider,
+            keyStore: MemoryKeyStore(),
+            attestGate: RetryGate(label: "t-attest", baseDelay: 5, maxDelay: 300),
+            keyRecoveryGate: RetryGate(label: "t-recovery", baseDelay: 5, maxDelay: 300)
+        )
+        try await manager.attestIfNeeded()
+
+        await withTaskGroup(of: Void.self) { group in
+            for i in 0..<6 {
+                group.addTask {
+                    _ = try? await manager.generateAssertion(
+                        challenge: "00ff", method: "GET", path: "/services/thing/\(i)"
+                    )
+                }
+            }
+            await group.waitForAll()
+        }
+
+        XCTAssertEqual(
+            provider.peakConcurrentAssertions, 1,
+            "assertions on one key must not overlap: the enclave hands out its "
+                + "counter in call order, and iOS 27 answers overlapping calls with invalidKey"
+        )
+    }
+
+    /// Serialising must not deadlock or drop callers — every request still gets
+    /// its assertion, they just take turns.
+    func testEveryConcurrentCallerStillGetsAnAssertion() async throws {
+        let provider = OverlapCountingProvider()
+        let manager = AppAttestManager(
+            networkClient: StubTransport(),
+            provider: provider,
+            keyStore: MemoryKeyStore(),
+            attestGate: RetryGate(label: "t-attest", baseDelay: 5, maxDelay: 300),
+            keyRecoveryGate: RetryGate(label: "t-recovery", baseDelay: 5, maxDelay: 300)
+        )
+        try await manager.attestIfNeeded()
+
+        let results = await withTaskGroup(of: Bool.self) { group -> [Bool] in
+            for i in 0..<6 {
+                group.addTask {
+                    let out = try? await manager.generateAssertion(
+                        challenge: "00ff", method: "GET", path: "/services/thing/\(i)"
+                    )
+                    return out != nil
+                }
+            }
+            var acc: [Bool] = []
+            for await r in group { acc.append(r) }
+            return acc
+        }
+
+        XCTAssertEqual(results.count, 6)
+        XCTAssertTrue(results.allSatisfy { $0 }, "no caller may be starved or dropped")
+    }
+}

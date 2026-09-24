@@ -51,6 +51,7 @@ final class AppAttestManager: @unchecked Sendable {
     private var _state: State = .uninitialized
     private var _phase: String = "idle"
     private var _lastError: String?
+    private var _disownedKeyId: String?
 
     /// The current attestation state. Thread-safe.
     var state: State { lock.withLock { _state } }
@@ -65,6 +66,24 @@ final class AppAttestManager: @unchecked Sendable {
     private func setState(_ newValue: State) { lock.withLock { _state = newValue } }
     private func setPhase(_ newValue: String) { lock.withLock { _phase = newValue } }
     private func setLastError(_ newValue: String?) { lock.withLock { _lastError = newValue } }
+    private func setDisownedKeyId(_ newValue: String?) { lock.withLock { _disownedKeyId = newValue } }
+
+    /// Has Apple disowned the key we are holding?
+    ///
+    /// Recorded rather than acted on, because the obvious response — wipe the
+    /// Keychain and reset state — races an attestation that may already be
+    /// running and about to write the very entries being deleted. Marking the
+    /// key instead leaves shared state alone; the wipe happens later inside the
+    /// gated single-flight, where nothing else can be mid-write.
+    var isKeyDisowned: Bool {
+        lock.withLock {
+            guard let disowned = _disownedKeyId else { return false }
+            switch _state {
+            case .attested(let id), .keyGenerated(let id): return id == disowned
+            case .uninitialized, .unsupported: return false
+            }
+        }
+    }
 
     init(
         networkClient: AttestTransport,
@@ -151,6 +170,21 @@ final class AppAttestManager: @unchecked Sendable {
         baseDelay: 5,
         maxDelay: 5 * 60
     )
+
+    /// Serialises `generateAssertion` across the whole process.
+    ///
+    /// A screen that fans out six requests asked Apple for six assertions on
+    /// one key at the same instant — measured, not assumed, in
+    /// `AssertionConcurrencyTests`. Two things go wrong with that. The enclave's
+    /// per-key counter is handed out in call order but the assertions then race
+    /// to the server, which requires it to arrive increasing and refuses the
+    /// laggards; and iOS 27 devices answer the overlapping calls with
+    /// `DCError.invalidKey`, disowning a key that had been signing happily.
+    ///
+    /// Only the enclave call is serialised. Challenge fetches stay parallel —
+    /// those are network round trips and queueing them would cost real latency,
+    /// where queueing a hardware signature costs microseconds.
+    private static let assertionSerialiser = AsyncSerialiser()
 
     /// The attestation currently running, so a caller that loses the claim can
     /// wait for its result instead of walking away.
@@ -251,7 +285,14 @@ final class AppAttestManager: @unchecked Sendable {
     func retryAttestationIfDue() async {
         switch state {
         case .attested:
-            return  // nothing to do
+            // A key Apple has disowned is not a working attestation. Nothing
+            // else will ask for its replacement — the assertion path stops
+            // offering it, so it never fails again and never triggers recovery
+            // — so this is where it gets picked up once the window allows.
+            if isKeyDisowned {
+                await recoverFromUnusableKey()
+            }
+            return
         case .unsupported:
             return  // genuinely unsupported hardware; retrying can't help
         case .uninitialized, .keyGenerated:
@@ -284,15 +325,16 @@ final class AppAttestManager: @unchecked Sendable {
             // so.
             ProsopoLogger.warning(
                 "Key reported unusable again inside the recovery backoff "
-                    + "(\(Int(keyRecoveryGate.secondsUntilRetry))s to go) — dropping the dead key "
+                    + "(\(Int(keyRecoveryGate.secondsUntilRetry))s to go) — marking the key dead "
                     + "and waiting rather than minting another"
             )
-            resetState()
+            markCurrentKeyDisowned()
             return
         }
         // Armed before the attempt, not after, so a burst of concurrent
         // assertion failures produces one recovery rather than one each.
         keyRecoveryGate.recordFailure("Apple reported the App Attest key unusable")
+        markCurrentKeyDisowned()
         try? await runGatedAttestation(resetFirst: true)
     }
 
@@ -511,6 +553,7 @@ final class AppAttestManager: @unchecked Sendable {
         }
 
         _ = keyStore.markAttested()
+        setDisownedKeyId(nil)
         setState(.attested(keyId: keyId))
         setPhase("attested")
         setLastError(nil)
@@ -590,7 +633,9 @@ final class AppAttestManager: @unchecked Sendable {
         // Generate the assertion via the Secure Enclave
         let assertion: Data
         do {
-            assertion = try await provider.generateAssertion(keyId, clientDataHash: clientDataHash)
+            assertion = try await Self.assertionSerialiser.run {
+                try await provider.generateAssertion(keyId, clientDataHash: clientDataHash)
+            }
         } catch where Self.isFrameworkFault(error) {
             throw Self.noteDeviceCheckFault(error, operation: .generateAssertion)
         }
@@ -604,6 +649,7 @@ final class AppAttestManager: @unchecked Sendable {
 
     /// Get the current key ID, if attested.
     var keyId: String? {
+        guard !isKeyDisowned else { return nil }
         switch state {
         case .attested(let id), .keyGenerated(let id):
             return id
@@ -615,6 +661,15 @@ final class AppAttestManager: @unchecked Sendable {
     /// Wipe stored credentials and reset state so the next `attestIfNeeded()`
     /// call regenerates a key and re-attests. Used when Apple reports the
     /// current key as invalid (DCError.invalidKey) during assertion.
+    private func markCurrentKeyDisowned() {
+        lock.withLock {
+            switch _state {
+            case .attested(let id), .keyGenerated(let id): _disownedKeyId = id
+            case .uninitialized, .unsupported: break
+            }
+        }
+    }
+
     func resetState() {
         keyStore.deleteAll()
         setState(.uninitialized)

@@ -24,7 +24,7 @@ public final class ProsopoAttestIOS: @unchecked Sendable {
 
     /// Version of this SDK build. Bumped per shipped zip; surfaced in the
     /// configure log line so a customer's logs identify which build is running.
-    public static let sdkVersion = "0.1.6"
+    public static let sdkVersion = "0.1.8"
 
     // MARK: - Internal state
 
