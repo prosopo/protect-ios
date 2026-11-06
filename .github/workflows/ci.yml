@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+    types:
+      - opened
+      - synchronize
+      - reopened
+      # Not a type this workflow runs for -- the job skips it. It exists so the
+      # run is created and cancels the in-flight one.
+      - converted_to_draft
+      - ready_for_review
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    if: ${{ github.event.pull_request.draft != true }}
+    # macos-15 ships Xcode 16 / Swift 6, which swift-tools-version 6.0 needs.
+    # GH_RUNNER_MACOS can route this onto the self-hosted macOS fleet.
+    runs-on: ${{ vars.GH_RUNNER_MACOS && startsWith(vars.GH_RUNNER_MACOS, '[') && fromJSON(format('["{0}","2c","4g","20d"]', join(fromJSON(vars.GH_RUNNER_MACOS), '","'))) || fromJSON(vars.GH_RUNNER_MACOS || '"macos-15"') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        timeout-minutes: 5
+
+      - name: Toolchain versions
+        run: swift --version && xcodebuild -version
+        timeout-minutes: 2
+
+      - name: SwiftLint
+        run: |
+          command -v swiftlint >/dev/null || brew install swiftlint
+          swiftlint lint --reporter github-actions-logging
+        timeout-minutes: 10
+
+      - name: Build (iOS)
+        run: |
+          xcodebuild build \
+            -scheme ProsopoAttestIOS \
+            -destination 'generic/platform=iOS' \
+            -skipPackagePluginValidation
+        timeout-minutes: 30
+
+      # Simulator names change with each Xcode, so take the first available iPhone.
+      - name: Test (iOS Simulator)
+        run: |
+          udid=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          print(next(d["udid"] for runtime, ds in devices.items() if "iOS" in runtime for d in ds if d["name"].startswith("iPhone")))')
+          xcodebuild test \
+            -scheme ProsopoAttestIOS \
+            -destination "id=$udid" \
+            -resultBundlePath TestResults.xcresult \
+            -skipPackagePluginValidation
+        timeout-minutes: 30
+
+      - name: Upload test results
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: TestResults.xcresult
+          path: TestResults.xcresult
+          if-no-files-found: ignore
+        timeout-minutes: 5
+    timeout-minutes: 60
