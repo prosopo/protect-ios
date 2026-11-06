@@ -1,0 +1,12 @@
+# Limits set to the code as it stood when CI was added, so new violations fail
+# without forcing a rewrite of existing files.
+included:
+  - Sources
+  - Tests
+file_length:
+  error: 1200
+type_body_length:
+  error: 450
+identifier_name:
+  allowed_symbols: ["_"]
+  excluded: [i, r, v]
