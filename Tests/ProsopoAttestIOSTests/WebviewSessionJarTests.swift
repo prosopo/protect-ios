@@ -195,6 +195,9 @@ final class WebviewSessionJarTests: XCTestCase {
             WebviewSessionObserver.shared.refreshAll()
             try await Task.sleep(nanoseconds: 100_000_000)
         }
+        let inStore = await configuration.websiteDataStore.httpCookieStore.allCookies()
+        let jsSeen = try? await webView.evaluateJavaScript("document.cookie") as? String
+        print("DIAG store=\(inStore.map { "\($0.name)@\($0.domain)" }) js=\(jsSeen ?? "nil") url=\(webView.url?.absoluteString ?? "nil")")
         XCTAssertEqual(
             ProsopoAttestIOS.shared.webviewSession.cookie(for: target)?.value,
             "bumblebee-webview|jwt"
