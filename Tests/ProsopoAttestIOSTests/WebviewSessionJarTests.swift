@@ -162,21 +162,23 @@ final class WebviewSessionJarTests: XCTestCase {
     }
 
 #if canImport(WebKit)
-    /// End to end through WebKit: a page setting `prosopo_session` the way
-    /// protect.js does makes it available to native requests, with no app code.
+    /// End to end through WebKit: a `prosopo_session` arriving in the WebView's
+    /// cookie store makes it available to native requests, with no app code.
+    ///
+    /// The cookie is put in the store directly, as a `Set-Cookie` response would.
+    /// A script in a `loadHTMLString` page cannot do it on iOS: the simulator's
+    /// WebKit never stores the cookie, though macOS does.
     ///
     /// The loop re-reads the store the way a signed request does, rather than
     /// waiting on WebKit's change notification, which is the unreliable half.
     @MainActor
-    func testACookieSetByThePageReachesTheJar() async throws {
+    func testACookieInTheWebviewStoreReachesTheJar() async throws {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
         ProsopoProtectWebview.install(into: configuration)
-        let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 100, height: 100), configuration: configuration)
 
-        webView.loadHTMLString(
-            "<script>document.cookie = 'prosopo_session=bumblebee-webview|jwt; path=/'</script>",
-            baseURL: url("https://webview.example.com/")
+        await configuration.websiteDataStore.httpCookieStore.setCookie(
+            cookie(value: "bumblebee-webview|jwt", domain: "webview.example.com", secure: true)
         )
 
         let target = url("https://webview.example.com/services/catalogue")
