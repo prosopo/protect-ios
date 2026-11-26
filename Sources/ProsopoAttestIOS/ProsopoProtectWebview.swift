@@ -21,6 +21,10 @@ import WebKit
 /// on demand. The result: WebView requests and native requests carry identical
 /// `X-Prosopo-*` headers and share one attestation identity.
 ///
+/// The session goes the other way. protect.js sets `prosopo_session` in the
+/// WebView's cookie store, and the SDK watches that store so signed native
+/// requests carry the same cookie. See ``WebviewSessionJar``.
+///
 /// ## Usage
 ///
 /// Configure the SDK once, then create a protected WebView:
@@ -119,6 +123,8 @@ public final class ProsopoProtectWebview {
             forMainFrameOnly: false
         )
         controller.addUserScript(script)
+
+        WebviewSessionObserver.shared.observe(configuration.websiteDataStore.httpCookieStore)
     }
 
     /// The JavaScript shim injected at document start in every frame.
@@ -262,6 +268,42 @@ extension ProsopoWebviewBridge: WKScriptMessageHandler {
               let challenge = message.body as? String
         else { return }
         ProsopoAttestIOS.shared.storeNextChallenge(challenge)
+    }
+}
+
+/// Keeps ``WebviewSessionJar`` in step with every WebKit cookie store a
+/// protected WebView can use: the default store from `configure`, plus any
+/// custom one passed through `install(into:)`.
+///
+/// The stores are retained here because `WKHTTPCookieStore` holds its observers
+/// weakly and a store must outlive the observation to keep reporting changes.
+@MainActor
+final class WebviewSessionObserver: NSObject, WKHTTPCookieStoreObserver {
+    static let shared = WebviewSessionObserver()
+
+    private var stores: [ObjectIdentifier: WKHTTPCookieStore] = [:]
+
+    func observe(_ store: WKHTTPCookieStore) {
+        let id = ObjectIdentifier(store)
+        guard stores[id] == nil else { return }
+        stores[id] = store
+        store.add(self)
+        refresh(store)
+    }
+
+    func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
+        refresh(cookieStore)
+    }
+
+    func refreshAll() {
+        stores.values.forEach(refresh)
+    }
+
+    private func refresh(_ store: WKHTTPCookieStore) {
+        let id = ObjectIdentifier(store)
+        store.getAllCookies { cookies in
+            ProsopoAttestIOS.shared.webviewSession.replace(cookies, from: id)
+        }
     }
 }
 #endif

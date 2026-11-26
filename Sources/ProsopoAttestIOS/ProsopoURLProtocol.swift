@@ -97,6 +97,7 @@ public final class ProsopoURLProtocol: URLProtocol {
             for (name, value) in headers {
                 outgoing.setValue(value, forHTTPHeaderField: name)
             }
+            attachWebviewSession(to: outgoing)
             ProsopoLogger.debug("Attached assertion headers to \(method) \(path)")
         } else if let operation = AppAttestManager.deviceCheckFaultOperation {
             // Once the exception barrier stops DeviceCheck faults from crashing
@@ -171,6 +172,25 @@ public final class ProsopoURLProtocol: URLProtocol {
     }
 
     // MARK: - Helpers
+
+    /// Put the WebView's session cookie on a request that is already signed.
+    ///
+    /// Signed requests only. The edge decides an attested request on its
+    /// assertion and ignores the cookie, so on a signed request the cookie just
+    /// records which WebView session this device is driving. On an unsigned
+    /// request it would move the request onto the web session path, where it is
+    /// checked against the WebView's browser identity. A native request cannot
+    /// match that identity, so it would be challenged with a captcha it has no
+    /// way to show, instead of getting the 401 deferral it can recover from.
+    private func attachWebviewSession(to outgoing: NSMutableURLRequest) {
+        guard let url = outgoing.url,
+              let cookie = ProsopoAttestIOS.shared.webviewSessionCookie(for: url)
+        else {
+            return
+        }
+        let header = WebviewSessionJar.merge(cookie, into: outgoing.value(forHTTPHeaderField: "Cookie"))
+        outgoing.setValue(header, forHTTPHeaderField: "Cookie")
+    }
 
     /// A mutable copy of the request, marked as already handled by this
     /// protocol.

@@ -3,6 +3,9 @@
 
 import DeviceCheck
 import Foundation
+#if canImport(WebKit)
+import WebKit
+#endif
 
 /// ProsopoAttestIOS SDK — transparent App Attest integration for iOS apps.
 ///
@@ -24,7 +27,7 @@ public final class ProsopoAttestIOS: @unchecked Sendable {
 
     /// Version of this SDK build. Bumped per shipped zip; surfaced in the
     /// configure log line so a customer's logs identify which build is running.
-    public static let sdkVersion = "0.1.8"
+    public static let sdkVersion = "0.1.9"
 
     // MARK: - Internal state
 
@@ -61,6 +64,10 @@ public final class ProsopoAttestIOS: @unchecked Sendable {
     /// `/api/ios/attest`. Matches `SESSION_GATE_TIMEOUT_MS` in the web bundle,
     /// which bounds the same risk on the same reasoning.
     static let attestationGateTimeout: TimeInterval = 4
+
+    /// The WebView's `prosopo_session`, attached to signed native requests so
+    /// both transports present one session. See ``WebviewSessionJar``.
+    let webviewSession = WebviewSessionJar()
 
     private init() {}
 
@@ -110,6 +117,15 @@ public final class ProsopoAttestIOS: @unchecked Sendable {
         URLProtocol.registerClass(ProsopoURLProtocol.self)
 
         ProsopoLogger.info("ProsopoAttestIOS \(Self.sdkVersion) configured with siteKey: \(siteKey)")
+
+        #if canImport(WebKit)
+        // The default store, because that is where a plain `WKWebView` running
+        // protect.js keeps its cookies, and an app does not have to adopt
+        // `ProsopoProtectWebview` for its WebView session to be shared.
+        Task { @MainActor in
+            WebviewSessionObserver.shared.observe(WKWebsiteDataStore.default().httpCookieStore)
+        }
+        #endif
 
         // Start attestation in background. Requests are held behind
         // `attestationReady` until this settles, so "non-blocking" now means
@@ -408,6 +424,18 @@ public final class ProsopoAttestIOS: @unchecked Sendable {
     func mergeProtectedRoutes(_ serverPrefixes: [String]) {
         guard let routes = protectedRoutes, routes.merge(serverPrefixes) else { return }
         ProsopoLogger.info("Protected routes updated from server: \(routes.known.joined(separator: ", "))")
+    }
+
+    /// The WebView session cookie to send to `url`, if there is one. Also
+    /// starts a throttled re-read of the WebView's cookie stores, without
+    /// waiting for it.
+    func webviewSessionCookie(for url: URL) -> HTTPCookie? {
+        #if canImport(WebKit)
+        if webviewSession.claimRefresh() {
+            Task { @MainActor in WebviewSessionObserver.shared.refreshAll() }
+        }
+        #endif
+        return webviewSession.cookie(for: url)
     }
 
     /// Store a challenge piggybacked on a response (from either transport).
