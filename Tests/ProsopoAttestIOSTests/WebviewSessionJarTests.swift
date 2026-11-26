@@ -6,6 +6,9 @@ import XCTest
 #if canImport(WebKit)
 import WebKit
 #endif
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// The WebView's `prosopo_session` riding on native requests.
 ///
@@ -173,6 +176,13 @@ final class WebviewSessionJarTests: XCTestCase {
         configuration.websiteDataStore = .nonPersistent()
         ProsopoProtectWebview.install(into: configuration)
         let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 100, height: 100), configuration: configuration)
+#if canImport(UIKit)
+        // iOS does not run scripts in a WKWebView that is in no window.
+        let window = UIWindow(frame: webView.frame)
+        window.addSubview(webView)
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+#endif
 
         webView.loadHTMLString(
             "<script>document.cookie = 'prosopo_session=bumblebee-webview|jwt; path=/'</script>",
